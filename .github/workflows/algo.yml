@@ -1,0 +1,50 @@
+name: AAG Live Algo (Paper)
+run-name: ${{ github.event.inputs.test == '1' && 'TEST run' || 'Algo run' }}
+
+on:
+  schedule:
+    # Mon-Fri. GitHub schedule kabhi late/skip karta hai, isliye 3 baar trigger.
+    # Pehla jo chalega wahi algo chalayega, baaki chup-chaap band ho jaate hain.
+    - cron: "47 2 * * 1-5"   # 08:17 IST
+    - cron: "7 3 * * 1-5"    # 08:37 IST
+    - cron: "27 3 * * 1-5"   # 08:57 IST
+  workflow_dispatch:
+    inputs:
+      test:
+        description: "Test run (abhi turant, 3 min ka)? 1 likho, normal ke liye 0"
+        default: "0"
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install packages
+        run: pip install -r requirements.txt
+
+      - name: Run algo
+        env:
+          UPSTOX_ACCESS_TOKEN: ${{ secrets.UPSTOX_ACCESS_TOKEN }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TEST_MODE: ${{ github.event.inputs.test || '0' }}
+        run: python algo.py
+
+      - name: Save trade history
+        if: always()
+        run: |
+          git config user.name "aag-bot"
+          git config user.email "aag-bot@users.noreply.github.com"
+          git add trade_history.csv 2>/dev/null || true
+          git diff --cached --quiet || (git commit -m "trade history" && git push)
