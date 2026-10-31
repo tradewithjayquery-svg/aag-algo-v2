@@ -1,0 +1,15 @@
+{
+  "enabled": true,
+  "entry_time": "09:20",
+  "exit_time": "12:30",
+  "sl_amount": 2500,
+  "target_amount": 4000,
+  "num_lots": 1,
+  "heartbeat_minutes": 10,
+  "late_start_grace_minutes": 3,
+  "list_size": 10,
+  "itm_levels": 2,
+  "max_spread_pct": 3.0,
+  "min_oi": 0,
+  "max_stock_tries": 3
+}
