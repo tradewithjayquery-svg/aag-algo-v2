@@ -5,7 +5,11 @@ Logic:
   - Entry time par F&O ka top gainer -> uska CALL kharido (paper)
   - Entry time par F&O ka top loser  -> uska PUT kharido (paper)
   - Strike sirf ATM / 1st ITM / 2nd ITM mein se, jo sabse liquid ho (OTM kabhi nahi)
+  - Sirf wahi stocks jinka lot size max_lot_size (default 2500) se kam ho
   - Har leg ka alag SL / Target (rupees mein), ya time exit
+  - SL/Target entry par hi price mein badal jaate hain (SL price = entry - SL_rupees / qty)
+  - Upstox ke live websocket feed se HAR TICK par check hota hai; SL/Target price touch hote hi
+    exact us price par exit. Feed na chale toh REST polling (poll_seconds) par apne aap chala jaata hai
   - Koi real order nahi jaata. Sirf Upstox ka live price padhte hain.
 
 Secrets (GitHub Secrets se aate hain, code mein nahi likhne):
@@ -18,8 +22,10 @@ import csv
 import gzip
 import io
 import json
+import math
 import os
 import sys
+import threading
 import time
 from datetime import date, datetime, timedelta, timezone
 
@@ -56,7 +62,14 @@ DEFAULTS = {
     "max_spread_pct": 3.0,    # bid-ask spread is % se zyada ho toh strike illiquid maano
     "min_oi": 0,              # kam se kam Open Interest (0 = check band)
     "max_stock_tries": 3,     # top stock ka option illiquid ho toh list mein agla stock (max itne)
+    # --- naye settings ---
+    "max_lot_size": 2500,     # sirf wahi stock jinka lot size isse KAM ho (0 = check band)
+    "poll_seconds": 5,        # sirf FALLBACK: feed band ho toh REST se kitne second mein price dekhe
+    "use_websocket": True,    # True = har tick par check (live feed); False = sirf REST polling
+    "feed_stale_seconds": 20, # itne second koi tick na aaye toh feed band maano, REST par jao
 }
+
+TICK = 0.05                   # option ka minimum price step
 
 BASE_URL = "https://www.nseindia.com"
 GAINERS_URL = f"{BASE_URL}/api/live-analysis-variations?index=gainers"
@@ -216,6 +229,26 @@ def get_live_ltp(instrument_key):
     except Exception as e:
         print(f"LTP parse error: {e}")
     return None
+
+
+def get_nifty_line():
+    """Nifty 50 ka spot, % aur points change. Data na mile toh None (line chhod di jaati hai)."""
+    data = upstox_get(
+        "https://api.upstox.com/v2/market-quote/quotes",
+        params={"instrument_key": "NSE_INDEX|Nifty 50"},
+        tries=2,
+    )
+    try:
+        v = list(((data or {}).get("data", {}) or {}).values())[0]
+        ltp = float(v["last_price"])
+        chg = float(v["net_change"])
+        prev = ltp - chg
+        if prev <= 0:
+            return None
+        return f"{'🟢' if chg >= 0 else '🔴'} NIFTY 50: {ltp:,.2f} | {chg / prev * 100:+.2f}% ({chg:+.2f} pts)"
+    except Exception as e:
+        print(f"Nifty data nahi mila: {e}")
+        return None
 
 
 def is_market_holiday(d):
@@ -455,9 +488,21 @@ def get_liquid_leg(symbol, ltp_fallback, expiry_date, lot_map, eq_map, side, cfg
 
 
 def pick_leg(rows, side, expiry, lot_map, eq_map, cfg):
-    """List ke upar se stock lo; uska option illiquid ho toh agla stock (max_stock_tries tak)."""
-    for rank, s in enumerate(rows[:int(cfg["max_stock_tries"])], 1):
+    """
+    List ke upar se stock lo. Lot size max_lot_size ya usse zyada ho toh stock chhod do
+    (ye try mein nahi gina jaata). Option illiquid ho toh bhi agla stock (max_stock_tries tak).
+    """
+    max_lot = int(cfg["max_lot_size"])
+    tries = 0
+    for rank, s in enumerate(rows, 1):
+        if tries >= int(cfg["max_stock_tries"]):
+            break
         sym = str(s["symbol"])
+        lot = lot_map.get(sym.upper())
+        if max_lot and lot and lot >= max_lot:
+            print(f"  #{rank} {sym}: lot size {lot} >= {max_lot}, skip")
+            continue
+        tries += 1
         leg = get_liquid_leg(sym, row_ltp(s), expiry, lot_map, eq_map, side, cfg)
         if leg and leg["lot"]:
             leg["rank"] = rank
@@ -532,8 +577,28 @@ def append_history(trade_summary, day):
 # TRADE ENGINE (paper)
 # =========================
 
-def make_leg(direction, info, entry, lots, entry_time):
+def _tick_up(x):
+    """Price ko upar ke nazdeeki 0.05 tick par laao."""
+    return round(math.ceil(round(x / TICK, 6)) * TICK, 2)
+
+
+def calc_levels(entry, qty, sl_amount, target_amount):
+    """
+    SL price  = entry - (SL rupees / qty)     [tick par upar round, taaki loss SL se zyada na ho]
+    Target    = entry + (Target rupees / qty)
+    Misal: lot 25, entry 1000, SL 2500 -> 1000 - 2500/25 = 900.
+    Agar premium itna gir hi nahi sakta ki SL rupees ka loss ho, toh SL = None.
+    """
+    sl_raw = entry - sl_amount / qty
+    sl_price = _tick_up(sl_raw) if sl_raw >= TICK else None
+    return sl_price, _tick_up(entry + target_amount / qty)
+
+
+def make_leg(direction, info, entry, lots, entry_time, sl_amount, target_amount):
+    qty = int(info["lot"]) * int(lots)
+    sl_price, target_price = calc_levels(float(entry), qty, sl_amount, target_amount)
     return {"direction": direction, "opt": "CE" if direction == "CALL" else "PE",
+            "sl_price": sl_price, "target_price": target_price,
             "symbol": info["symbol"], "key": info["key"], "eq_key": info["eq_key"],
             "strike": info["strike"], "info": info,
             "entry": float(entry), "spot_entry": float(info["spot"]), "spot": float(info["spot"]),
@@ -562,7 +627,7 @@ def leg_entry_block(lg):
     lines = [f"{icon(lg)} BUY {lg['direction']}",
              f"Stock: {lg['symbol']}"]
     if i.get("rank", 1) > 1:
-        lines.append(f"(List mein #{i['rank']} stock; upar wale ka option illiquid tha)")
+        lines.append(f"(List mein #{i['rank']} stock; upar ke stocks lot size ya liquidity ki wajah se skip hue)")
     lines += [f"Spot (CMP): ₹{lg['spot_entry']:.2f}",
               f"Strike: {lg['strike']:g} ({i['label']})",
               f"Option type: {lg['direction']} ({lg['opt']})",
@@ -571,34 +636,71 @@ def leg_entry_block(lg):
               f"Open Interest: {int(i['oi']):,}",
               f"Lot size: {lg['lot']} × {lg['lots']} lot = Qty {lg['qty']}",
               f"Expiry: {lg['expiry']}"]
+    if lg["sl_price"] is not None:
+        loss = (lg["entry"] - lg["sl_price"]) * lg["qty"]
+        lines.append(f"🛑 SL price: ₹{lg['sl_price']:.2f} (loss ≈ ₹{loss:,.0f})")
+    else:
+        lines.append("🛑 SL: nahi (is premium par poora loss bhi SL se kam hai)")
+    gain = (lg["target_price"] - lg["entry"]) * lg["qty"]
+    lines.append(f"🎯 Target price: ₹{lg['target_price']:.2f} (profit ≈ ₹{gain:,.0f})")
     return "\n".join(lines)
 
 
-def close_leg(lg, price, now_str, reason):
-    lg["exit_price"], lg["exit_time"], lg["reason"], lg["status"] = price, now_str, reason, "CLOSED"
-    spot = get_live_ltp(lg["eq_key"]) or lg["spot"]
-    lg["spot_exit"] = spot
-    tg(f"{reason}\n"
+# ---- State (network ke bina; tick thread mein bhi safe) ----
+STATE_LOCK = threading.Lock()
+
+
+def close_state(lg, price, now_sec, reason):
+    lg["exit_price"], lg["exit_time"], lg["reason"], lg["status"] = price, now_sec, reason, "CLOSED"
+    lg["spot_exit"] = lg["spot"]
+
+
+def check_exit(lg, price, now_sec):
+    """SL ya Target price touch hua toh EXACT us price par band karo. True agar band hua."""
+    if lg["status"] != "OPEN":
+        return False
+    if lg["sl_price"] is not None and price <= lg["sl_price"]:
+        close_state(lg, lg["sl_price"], now_sec, "🛑 SL HIT")
+        return True
+    if price >= lg["target_price"]:
+        close_state(lg, lg["target_price"], now_sec, "🎯 TARGET HIT")
+        return True
+    return False
+
+
+def refresh_spot(lg):
+    """REST se spot lo (feed na ho tab); band leg ka spot_exit bhi yahi hota hai."""
+    sp = get_live_ltp(lg["eq_key"])
+    if sp:
+        lg["spot"] = sp
+        if lg["status"] == "CLOSED":
+            lg["spot_exit"] = sp
+
+
+def announce_close(lg):
+    tg(f"{lg['reason']}\n"
        f"{icon(lg)} {lg['direction']} — {leg_name(lg)}\n"
-       f"Exit time: {now_str}\n"
-       f"Option price: ₹{lg['entry']:.2f} → ₹{price:.2f}\n"
-       f"Spot (CMP): ₹{lg['spot_entry']:.2f} → ₹{spot:.2f}\n"
+       f"Exit time: {lg['exit_time']}\n"
+       f"Option price: ₹{lg['entry']:.2f} → ₹{lg['exit_price']:.2f}\n"
+       f"Spot (CMP): ₹{lg['spot_entry']:.2f} → ₹{lg['spot_exit']:.2f}\n"
        f"Lot size: {lg['lot']} × {lg['lots']} lot = Qty {lg['qty']}\n"
        f"PnL: ₹{leg_mtm(lg):+.2f}")
 
 
-def live_pnl_msg(legs, now_str):
+def live_pnl_msg(legs, now_str, use_rest=True):
     lines = [f"💓 LIVE PNL — {now_str}"]
     total = 0.0
     for lg in legs:
-        if lg["status"] == "OPEN":
+        if lg["status"] == "OPEN" and use_rest:
             sp = get_live_ltp(lg["eq_key"])
             if sp:
                 lg["spot"] = sp
-            price, spot, st = lg["ltp"], lg["spot"], "OPEN"
-        else:
-            price, spot, st = lg["exit_price"], lg["spot_exit"] or lg["spot"], "CLOSED"
-        m = leg_mtm(lg)
+        with STATE_LOCK:
+            if lg["status"] == "OPEN":
+                price, spot, st = lg["ltp"], lg["spot"], "OPEN"
+            else:
+                price, spot, st = lg["exit_price"], lg["spot_exit"] or lg["spot"], "CLOSED"
+            m = leg_mtm(lg)
         total += m
         lines.append(f"\n{icon(lg)} {lg['direction']} {leg_name(lg)}  [{st}]\n"
                      f"Spot ₹{spot:.2f} | Option ₹{price:.2f}\n"
@@ -607,54 +709,203 @@ def live_pnl_msg(legs, now_str):
     return "\n".join(lines)
 
 
+# =========================
+# LIVE TICK FEED (Upstox websocket, official upstox-python-sdk)
+# =========================
+
+def extract_ticks(msg):
+    """Feed message (dict) se {instrument_key: ltp}. 'ltpc' aur 'full' dono format chalte hain."""
+    out = {}
+    feeds = msg.get("feeds") if isinstance(msg, dict) else None
+    for key, f in (feeds or {}).items():
+        try:
+            ltpc = (f or {}).get("ltpc")
+            if not ltpc:
+                ff = (f or {}).get("fullFeed", {}) or {}
+                ltpc = (ff.get("marketFF") or ff.get("indexFF") or {}).get("ltpc")
+            ltp = float((ltpc or {}).get("ltp"))
+            if ltp > 0:
+                out[key] = ltp
+        except Exception:
+            continue
+    return out
+
+
+class TickFeed:
+    def __init__(self, token, keys, on_tick):
+        self.token, self.keys, self.on_tick = token, list(keys), on_tick
+        self.streamer = None
+        self.last_tick = 0.0     # kisi bhi instrument ka aakhri tick (feed zinda hai ya nahi)
+        self.error = None
+
+    def start(self):
+        try:
+            import upstox_client
+
+            cfg = upstox_client.Configuration()
+            cfg.access_token = self.token
+            self.streamer = upstox_client.MarketDataStreamerV3(
+                upstox_client.ApiClient(cfg), self.keys, "ltpc")
+            self.streamer.on("message", self._on_message)
+            self.streamer.on("error", lambda *a: print(f"Feed error: {a}"))
+            try:
+                self.streamer.auto_reconnect(True, 5, 20)
+            except Exception as e:
+                print(f"auto_reconnect set nahi hua: {e}")
+            threading.Thread(target=self.streamer.connect, daemon=True).start()
+            return True
+        except Exception as e:
+            self.error = f"{type(e).__name__}: {e}"
+            return False
+
+    def _on_message(self, msg):
+        ticks = extract_ticks(msg)
+        if not ticks:
+            return
+        self.last_tick = time.time()
+        for k, p in ticks.items():
+            try:
+                self.on_tick(k, p)
+            except Exception as e:
+                print(f"tick handler error: {e}")
+
+    def healthy(self, stale):
+        return self.last_tick > 0 and (time.time() - self.last_tick) <= stale
+
+    def stop(self):
+        try:
+            if self.streamer:
+                self.streamer.disconnect()
+        except Exception:
+            pass
+
+
 def run_trade(cfg, legs, exit_time):
-    sl, target = cfg["sl_amount"], cfg["target_amount"]
+    """
+    Feed chalu: har tick par SL/Target check (tick thread mein), exact price par exit.
+    Feed band/khamosh (feed_stale_seconds): REST se har poll_seconds par check - purani tarah.
+    Main loop har 1 sec: Telegram bhejna, minute log, heartbeat, time exit.
+    """
     hb_secs = (1 if TEST_MODE else int(cfg["heartbeat_minutes"])) * 60
+    poll = max(1, int(cfg["poll_seconds"]))
+    stale = int(cfg["feed_stale_seconds"])
     last_hb = time.time()
+    last_min = None
+    last_rest = 0.0
+    pending = []                      # tick thread mein band hue legs; announce main thread karta hai
     ce, pe = legs
+
+    by_key = {}
+    for lg in legs:
+        by_key.setdefault(lg["key"], []).append(("opt", lg))
+        by_key.setdefault(lg["eq_key"], []).append(("spot", lg))
+
+    def on_tick(key, price):
+        now_sec = now_ist().strftime("%H:%M:%S")
+        with STATE_LOCK:
+            for kind, lg in by_key.get(key, []):
+                if lg["status"] != "OPEN":
+                    continue
+                if kind == "spot":
+                    lg["spot"] = price
+                else:
+                    lg["ltp"] = price
+                    if check_exit(lg, price, now_sec):
+                        pending.append(lg)
+
+    def flush_pending():
+        while True:
+            with STATE_LOCK:
+                if not pending:
+                    return
+                lg = pending.pop(0)
+            announce_close(lg)
+
+    feed, started_at = None, time.time()
+    if cfg["use_websocket"]:
+        feed = TickFeed(UPSTOX_ACCESS_TOKEN, list(by_key.keys()), on_tick)
+        if not feed.start():
+            tg_admin(f"⚠️ Live tick feed shuru nahi hua ({feed.error}). REST polling par chal raha hoon.")
+            feed = None
+    confirmed, fell_back = False, False
 
     print(f"\n{'Time':<6} | {'CE LTP':>8} | {'CE MTM':>10} | {'PE LTP':>8} | {'PE MTM':>10} | {'Combined':>10}")
     print("-" * 70)
 
-    while True:
-        t0 = time.time()
-        now_str = now_ist().strftime("%H:%M")
-        past_exit = now_str >= exit_time or (not TEST_MODE and now_str > "15:30")
+    try:
+        while True:
+            now = now_ist()
+            now_str, now_sec = now.strftime("%H:%M"), now.strftime("%H:%M:%S")
+            feed_ok = bool(feed and feed.healthy(stale))
+            past_exit = now_str >= exit_time or (not TEST_MODE and now_str > "15:30")
 
-        if past_exit:
-            for lg in legs:
-                if lg["status"] == "OPEN":
-                    ltp = get_live_ltp(lg["key"]) or lg["ltp"]
-                    lg["ltp"] = ltp
-                    close_leg(lg, ltp, now_str, "⏰ TIME EXIT")
-            break
-        if all(lg["status"] == "CLOSED" for lg in legs):
-            break
+            if feed and feed_ok and not confirmed:
+                confirmed = True
+                tg_admin("📡 Live tick feed chalu: SL/Target ab har tick par check ho raha hai.")
+            if feed and not feed_ok and not fell_back and time.time() - started_at > stale + 10:
+                fell_back = True
+                tg_admin("⚠️ Live feed se tick nahi aa rahe. REST polling "
+                         f"(har {poll} sec) par chal raha hoon.")
+            if feed and feed_ok and fell_back:
+                fell_back = False
+                tg_admin("✅ Live tick feed wapas chalu.")
 
-        for lg in legs:
-            if lg["status"] == "OPEN":
-                ltp = get_live_ltp(lg["key"])
-                if ltp:
-                    lg["ltp"] = ltp
-                lg["log"].append({"time": now_str, "ltp": lg["ltp"], "mtm": leg_mtm(lg)})
+            if past_exit:
+                for lg in legs:
+                    if lg["status"] != "OPEN":
+                        continue
+                    ltp = None if feed_ok else get_live_ltp(lg["key"])
+                    with STATE_LOCK:
+                        if lg["status"] != "OPEN":
+                            continue
+                        if ltp:
+                            lg["ltp"] = ltp
+                        close_state(lg, lg["ltp"], now_sec, "⏰ TIME EXIT")
+                        pending.append(lg)
+                    if not feed_ok:
+                        refresh_spot(lg)
+                flush_pending()
+                break
 
-        combined = round(leg_mtm(ce) + leg_mtm(pe), 2)
-        print(f"{now_str:<6} | ₹{ce['ltp']:>7.2f} | ₹{leg_mtm(ce):>9.2f} | "
-              f"₹{pe['ltp']:>7.2f} | ₹{leg_mtm(pe):>9.2f} | ₹{combined:>9.2f}")
+            flush_pending()
+            if all(lg["status"] == "CLOSED" for lg in legs):
+                break
 
-        for lg in legs:
-            if lg["status"] == "OPEN":
-                m = leg_mtm(lg)
-                if m >= target:
-                    close_leg(lg, lg["ltp"], now_str, "🎯 TARGET HIT")
-                elif m <= -sl:
-                    close_leg(lg, lg["ltp"], now_str, "🛑 SL HIT")
+            if not feed_ok and time.time() - last_rest >= poll:      # REST fallback
+                last_rest = time.time()
+                for lg in legs:
+                    if lg["status"] != "OPEN":
+                        continue
+                    ltp = get_live_ltp(lg["key"])
+                    if not ltp:
+                        continue
+                    with STATE_LOCK:
+                        lg["ltp"] = ltp
+                        closed = check_exit(lg, ltp, now_sec)
+                        if closed:
+                            pending.append(lg)
+                    if closed:
+                        refresh_spot(lg)
+                flush_pending()
 
-        if time.time() - last_hb >= hb_secs and any(lg["status"] == "OPEN" for lg in legs):
-            last_hb = time.time()
-            tg(live_pnl_msg(legs, now_str))
+            if now_str != last_min:
+                last_min = now_str
+                with STATE_LOCK:
+                    for lg in legs:
+                        if lg["status"] == "OPEN":
+                            lg["log"].append({"time": now_str, "ltp": lg["ltp"], "mtm": leg_mtm(lg)})
+                    row = (ce["ltp"], leg_mtm(ce), pe["ltp"], leg_mtm(pe))
+                print(f"{now_str:<6} | ₹{row[0]:>7.2f} | ₹{row[1]:>9.2f} | "
+                      f"₹{row[2]:>7.2f} | ₹{row[3]:>9.2f} | ₹{row[1] + row[3]:>9.2f}")
 
-        time.sleep(max(1, 60 - (time.time() - t0)))
+            if time.time() - last_hb >= hb_secs and any(lg["status"] == "OPEN" for lg in legs):
+                last_hb = time.time()
+                tg(live_pnl_msg(legs, now_str, use_rest=not feed_ok))
+
+            time.sleep(1)
+    finally:
+        if feed:
+            feed.stop()
 
 
 def wait_until_entry(entry_time, grace_min):
@@ -720,7 +971,8 @@ def main():
 
     tg(f"{tag}🟢 AAG Algo chalu (Paper trade)\n"
        f"Entry {entry_time} | Exit {exit_time}\n"
-       f"Har leg: SL ₹{cfg['sl_amount']} | Target ₹{cfg['target_amount']} | Lots {cfg['num_lots']}")
+       f"Har leg: SL ₹{cfg['sl_amount']} | Target ₹{cfg['target_amount']} | Lots {cfg['num_lots']}"
+       + (f"\nSirf lot size {cfg['max_lot_size']} se kam wale stocks" if cfg["max_lot_size"] else ""))
 
     lot_map, eq_map, fo_syms = load_fo_instruments()
     if not lot_map:
@@ -737,7 +989,9 @@ def main():
         return
     gainers, losers = res
     n = int(cfg["list_size"])
-    tg(f"{tag}📊 {entry_time} — F&O TOP GAINERS & LOSERS\n\n"
+    nifty = get_nifty_line()
+    tg(f"{tag}📊 {entry_time} — F&O TOP GAINERS & LOSERS\n"
+       + (f"{nifty}\n" if nifty else "") + "\n"
        + fmt_list("🟢 TOP GAINERS", gainers, n) + "\n\n"
        + fmt_list("🔴 TOP LOSERS", losers, n))
 
@@ -746,7 +1000,7 @@ def main():
     pe = pick_leg(losers, "PE", expiry, lot_map, eq_map, cfg)
     if not ce or not pe:
         skip(f"liquid strike nahi mila (CE: {'mila' if ce else 'nahi'}, PE: {'mila' if pe else 'nahi'}, "
-             f"expiry {expiry}). max_spread_pct ya max_stock_tries badhakar dekho.", notify_all=True)
+             f"expiry {expiry}). max_spread_pct ya max_stock_tries badhakar dekho (lot size >= max_lot_size wale stocks bhi chhode jaate hain).", notify_all=True)
         return
 
     ce_entry = get_live_ltp(ce["key"]) or ce["ltp"]
@@ -757,8 +1011,8 @@ def main():
 
     actual_entry = now_ist().strftime("%H:%M")
     lots = int(cfg["num_lots"])
-    ce_leg = make_leg("CALL", ce, ce_entry, lots, actual_entry)
-    pe_leg = make_leg("PUT", pe, pe_entry, lots, actual_entry)
+    ce_leg = make_leg("CALL", ce, ce_entry, lots, actual_entry, cfg["sl_amount"], cfg["target_amount"])
+    pe_leg = make_leg("PUT", pe, pe_entry, lots, actual_entry, cfg["sl_amount"], cfg["target_amount"])
 
     tg(f"{tag}🚀 TRADE ENTRY (Paper) — {actual_entry}\n\n"
        f"{leg_entry_block(ce_leg)}\n\n{leg_entry_block(pe_leg)}\n\n"
@@ -802,3 +1056,5 @@ if __name__ == "__main__":
     except Exception as e:
         tg_admin(f"❌ Algo crash hua: {type(e).__name__}: {e}")
         raise
+    sys.stdout.flush()
+    os._exit(0)        # websocket ka thread band na ho paaye toh bhi process khatam ho

@@ -11,5 +11,9 @@
   "itm_levels": 2,
   "max_spread_pct": 3.0,
   "min_oi": 0,
-  "max_stock_tries": 3
+  "max_stock_tries": 3,
+  "max_lot_size": 2500,
+  "poll_seconds": 5,
+  "use_websocket": true,
+  "feed_stale_seconds": 20
 }
