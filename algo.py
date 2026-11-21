@@ -2,8 +2,9 @@
 AAG LIVE ALGO - Paper Trade (cloud version)
 
 Logic:
-  - Entry time par F&O ka top gainer -> uska CALL kharido (paper)
-  - Entry time par F&O ka top loser  -> uska PUT kharido (paper)
+  - Entry time par top gainer -> uska CALL kharido (paper); top loser -> uska PUT kharido (paper)
+  - use_watchlist=true ho toh top gainer/loser sirf watchlist.txt ke stocks mein se (F&O wale) chune jaate hain,
+    warna poore F&O market mein se. Gainer sirf + % wala, loser sirf - % wala.
   - Strike sirf ATM / 1st ITM / 2nd ITM mein se, jo sabse liquid ho (OTM kabhi nahi)
   - Sirf wahi stocks jinka lot size max_lot_size (default 2500) se kam ho
   - Har leg ka alag SL / Target (rupees mein), ya time exit
@@ -56,7 +57,7 @@ DEFAULTS = {
     "num_lots": 1,
     "heartbeat_minutes": 10,
     "late_start_grace_minutes": 3,
-    "list_size": 10,
+    "list_size": 5,
     # --- liquidity settings ---
     "itm_levels": 2,          # ATM + kitne ITM strike dekhne hain (2 = ATM, ITM1, ITM2)
     "max_spread_pct": 3.0,    # bid-ask spread is % se zyada ho toh strike illiquid maano
@@ -66,6 +67,9 @@ DEFAULTS = {
     "max_lot_size": 2500,     # sirf wahi stock jinka lot size isse KAM ho (0 = check band)
     "poll_seconds": 5,        # sirf FALLBACK: feed band ho toh REST se kitne second mein price dekhe
     "use_websocket": True,    # True = har tick par check (live feed); False = sirf REST polling
+    "use_watchlist": True,    # True = top gainer/loser sirf watchlist.txt ke stocks mein se
+    "watchlist_file": "watchlist.csv",
+    "require_direction": True,  # gainer sirf + % wala, loser sirf - % wala (flat/ulte din ke liye)
     "feed_stale_seconds": 20, # itne second koi tick na aaye toh feed band maano, REST par jao
 }
 
@@ -272,7 +276,7 @@ def load_fo_instruments():
         )
         df = pd.read_csv(io.BytesIO(gzip.decompress(r.content)))
         fo = df[(df["exchange"] == "NSE_FO") & (df["instrument_type"] == "OPTSTK")].copy()
-        fo["base_symbol"] = fo["tradingsymbol"].str.extract(r"^([A-Z&\-]+)")
+        fo["base_symbol"] = fo["tradingsymbol"].str.extract(r"^([A-Z0-9&\-]+)")
         lot_map = fo.groupby("base_symbol")["lot_size"].first().astype(int).to_dict()
         fo_syms = sorted(lot_map.keys())
         eq = df[(df["exchange"] == "NSE_EQ") & (df["instrument_type"] == "EQUITY")]
@@ -345,8 +349,16 @@ def row_pct(s):
 def fmt_list(title, rows, n):
     lines = [title]
     for i, s in enumerate(rows[:n], 1):
-        lines.append(f"{i}. {s.get('symbol', '-')}  ₹{row_ltp(s):.2f}  ({row_pct(s):+.2f}%)")
+        pts = f"  {s['chg']:+.2f} pts" if s.get("chg") is not None else ""
+        lines.append(f"{i}. {s.get('symbol', '-')}  ₹{row_ltp(s):.2f}{pts}  ({row_pct(s):+.2f}%)")
     return "\n".join(lines)
+
+
+def nifty_line_from(ltp, cp):
+    if not ltp or not cp or cp <= 0:
+        return None
+    chg = ltp - cp
+    return f"{'🟢' if chg >= 0 else '🔴'} NIFTY 50: {ltp:,.2f} | {chg / cp * 100:+.2f}% ({chg:+.2f} pts)"
 
 
 def fetch_primary_gainers_losers():
@@ -368,9 +380,9 @@ def fetch_primary_gainers_losers():
     return None
 
 
-def upstox_gainers_losers(eq_map, fo_syms):
-    """Pehla source fail ho toh Upstox ke quotes se top gainers/losers nikalo."""
-    keys = [eq_map[s] for s in fo_syms if s in eq_map]
+def upstox_rows(eq_map, syms):
+    """Diye hue symbols ka (price, % change) Upstox quotes se."""
+    keys = [eq_map[x] for x in syms if x in eq_map]
     rows = []
     for i in range(0, len(keys), 400):
         data = upstox_get(
@@ -387,13 +399,94 @@ def upstox_gainers_losers(eq_map, fo_syms):
                         "symbol": v.get("symbol") or k.split(":")[-1],
                         "lastPrice": ltp,
                         "pChange": round(chg / prev * 100, 2),
+                        "chg": round(chg, 2),
                     })
             except Exception:
                 continue
+    return rows
+
+
+def upstox_gainers_losers(eq_map, fo_syms):
+    """Pehla source fail ho toh Upstox ke quotes se top gainers/losers nikalo."""
+    rows = upstox_rows(eq_map, fo_syms)
     if not rows:
         return None
     return (sorted(rows, key=lambda x: -x["pChange"])[:20],
             sorted(rows, key=lambda x: x["pChange"])[:20])
+
+
+def load_watchlist(path):
+    """
+    watchlist.csv: columns 'stock name,symbol' (ya sirf 'symbol'). Symbol mein '|' se alternate
+    de sakte ho (jaise LTM|LTIM). Purana txt format (comma/line se symbols) bhi chalta hai.
+    Return: list of [alternate symbols...] (ek stock = ek entry).
+    """
+    out = []
+
+    def add(raw):
+        alts = []
+        for p in str(raw).split("|"):
+            sym = p.strip().upper()
+            for pre in ("NSE:", "NSE_EQ:"):
+                if sym.startswith(pre):
+                    sym = sym[len(pre):]
+            if sym.endswith(".NS"):
+                sym = sym[:-3]
+            if sym:
+                alts.append(sym)
+        if alts and alts not in out:
+            out.append(alts)
+
+    try:
+        import csv
+        with open(path, encoding="utf-8-sig", newline="") as f:
+            rows = [r for r in csv.reader(f) if r and any(c.strip() for c in r)]
+        if rows:
+            head = [c.strip().lower() for c in rows[0]]
+            if "symbol" in head:
+                i = head.index("symbol")
+                for r in rows[1:]:
+                    if len(r) > i:
+                        add(r[i])
+            else:                                   # header nahi: purana txt/comma format
+                for r in rows:
+                    line = ",".join(r).split("#", 1)[0]
+                    for tok in line.replace(";", ",").replace(" ", ",").split(","):
+                        add(tok)
+    except Exception as e:
+        print(f"watchlist padh nahi paaye: {e}")
+    return out
+
+
+def resolve_watchlist(entries, eq_map, lot_map):
+    """Har stock ke alternates mein se jo F&O + equity key wala mile wahi. (symbols, ignored)"""
+    syms, ignored = [], []
+    for alts in entries:
+        pick = next((x for x in alts if x in lot_map and x in eq_map), None)
+        if pick:
+            if pick not in syms:
+                syms.append(pick)
+        else:
+            ignored.append(alts[0])
+    return syms, ignored
+
+
+def rows_from_quotes(quotes, key_to_sym, syms):
+    """TickFeed.quotes ({key:(ltp, prev_close)}) se rows. Jinka data nahi aaya wo missing."""
+    rows, missing = [], []
+    for sym in syms:
+        q = quotes.get(next((k for k, v in key_to_sym.items() if v == sym), None))
+        if q and q[0] and q[1] and q[1] > 0:
+            chg = q[0] - q[1]
+            rows.append({"symbol": sym, "lastPrice": q[0], "chg": round(chg, 2),
+                         "pChange": round(chg / q[1] * 100, 2)})
+        else:
+            missing.append(sym)
+    return rows, missing
+
+
+def rank_rows(rows):
+    return (sorted(rows, key=lambda x: -x["pChange"]), sorted(rows, key=lambda x: x["pChange"]))
 
 
 def get_gainers_losers(eq_map, fo_syms):
@@ -731,12 +824,33 @@ def extract_ticks(msg):
     return out
 
 
+def extract_ltpc(msg):
+    """Feed message se {instrument_key: (ltp, prev_close)}. prev_close = ltpc ka 'cp'."""
+    out = {}
+    feeds = msg.get("feeds") if isinstance(msg, dict) else None
+    for key, f in (feeds or {}).items():
+        try:
+            ltpc = (f or {}).get("ltpc")
+            if not ltpc:
+                ff = (f or {}).get("fullFeed", {}) or {}
+                ltpc = (ff.get("marketFF") or ff.get("indexFF") or {}).get("ltpc")
+            ltp = float((ltpc or {}).get("ltp"))
+            cp = (ltpc or {}).get("cp")
+            cp = float(cp) if cp is not None else 0.0
+            if ltp > 0:
+                out[key] = (ltp, cp)
+        except Exception:
+            continue
+    return out
+
+
 class TickFeed:
     def __init__(self, token, keys, on_tick):
         self.token, self.keys, self.on_tick = token, list(keys), on_tick
         self.streamer = None
         self.last_tick = 0.0     # kisi bhi instrument ka aakhri tick (feed zinda hai ya nahi)
         self.error = None
+        self.quotes = {}         # {key: (ltp, prev_close)} - ranking ke liye
 
     def start(self):
         try:
@@ -759,6 +873,9 @@ class TickFeed:
             return False
 
     def _on_message(self, msg):
+        for k, q in extract_ltpc(msg).items():
+            old = self.quotes.get(k)
+            self.quotes[k] = (q[0], q[1] or (old[1] if old else 0.0))
         ticks = extract_ticks(msg)
         if not ticks:
             return
@@ -972,28 +1089,81 @@ def main():
     tg(f"{tag}🟢 AAG Algo chalu (Paper trade)\n"
        f"Entry {entry_time} | Exit {exit_time}\n"
        f"Har leg: SL ₹{cfg['sl_amount']} | Target ₹{cfg['target_amount']} | Lots {cfg['num_lots']}"
-       + (f"\nSirf lot size {cfg['max_lot_size']} se kam wale stocks" if cfg["max_lot_size"] else ""))
+       + (f"\nSirf lot size {cfg['max_lot_size']} se kam wale stocks" if cfg["max_lot_size"] else "")
+       + ("\nStocks: sirf meri watchlist mein se" if cfg["use_watchlist"] else ""))
 
     lot_map, eq_map, fo_syms = load_fo_instruments()
     if not lot_map:
         skip("F&O instruments list load nahi hui", notify_all=True)
         return
 
+    watch_feed, key_to_sym, syms, nifty_key = None, {}, [], "NSE_INDEX|Nifty 50"
+    if cfg["use_watchlist"]:
+        entries = load_watchlist(os.path.join(HERE, cfg["watchlist_file"]))
+        syms, ignored = resolve_watchlist(entries, eq_map, lot_map)
+        if not syms:
+            skip(f"{cfg['watchlist_file']} khali hai ya mili nahi / koi F&O stock nahi mila.", notify_all=True)
+            return
+        if ignored:
+            tg_admin("ℹ️ Watchlist ke ye symbols chhode gaye (F&O mein nahi / symbol galat): "
+                     + ", ".join(ignored))
+        key_to_sym = {eq_map[x]: x for x in syms}
+        if cfg["use_websocket"]:
+            watch_feed = TickFeed(UPSTOX_ACCESS_TOKEN, list(key_to_sym) + [nifty_key], lambda k, p: None)
+            if not watch_feed.start():
+                print(f"Watch feed start nahi hua: {watch_feed.error}")
+                watch_feed = None
+
     if not wait_until_entry(entry_time, int(cfg["late_start_grace_minutes"])):
+        if watch_feed:
+            watch_feed.stop()
         skip(f"algo late start hua (entry time {entry_time} nikal chuka), galat price se bachne ke liye skip")
         return
 
-    res = get_gainers_losers(eq_map, fo_syms)
-    if not res:
-        skip("gainers/losers data nahi mila", notify_all=True)
-        return
-    gainers, losers = res
+    nifty = None
+    if cfg["use_watchlist"]:
+        rows, src = [], "REST"
+        if watch_feed:
+            time.sleep(1)
+            rows, missing = rows_from_quotes(watch_feed.quotes, key_to_sym, syms)
+            if len(rows) >= 0.8 * len(syms):
+                src = "websocket"
+            else:
+                tg_admin(f"ℹ️ Live feed se sirf {len(rows)}/{len(syms)} stocks ka data aaya, REST se le rahe hain.")
+                rows = []
+            q = watch_feed.quotes.get(nifty_key)
+            if q:
+                nifty = nifty_line_from(q[0], q[1])
+            watch_feed.stop()
+        if not rows:
+            rows = upstox_rows(eq_map, syms)
+        if not rows:
+            skip(f"watchlist ({len(syms)} F&O stocks) ka price data nahi mila", notify_all=True)
+            return
+        print(f"Ranking source: {src}, {len(rows)}/{len(syms)} stocks")
+        gainers, losers = rank_rows(rows)
+        title = "WATCHLIST TOP GAINERS & LOSERS"
+    else:
+        res = get_gainers_losers(eq_map, fo_syms)
+        if not res:
+            skip("gainers/losers data nahi mila", notify_all=True)
+            return
+        gainers, losers = res
+        title = "F&O TOP GAINERS & LOSERS"
     n = int(cfg["list_size"])
-    nifty = get_nifty_line()
-    tg(f"{tag}📊 {entry_time} — F&O TOP GAINERS & LOSERS\n"
+    nifty = nifty or get_nifty_line()
+    tg(f"{tag}📊 {entry_time} — {title}\n"
        + (f"{nifty}\n" if nifty else "") + "\n"
        + fmt_list("🟢 TOP GAINERS", gainers, n) + "\n\n"
        + fmt_list("🔴 TOP LOSERS", losers, n))
+
+    if cfg["require_direction"]:      # CALL sirf + % wale stock par, PUT sirf - % wale par
+        gainers = [r for r in gainers if row_pct(r) > 0]
+        losers = [r for r in losers if row_pct(r) < 0]
+        if not gainers or not losers:
+            skip(f"{'koi gainer (+) nahi' if not gainers else 'koi loser (-) nahi'} mila, "
+                 "isliye aaj trade nahi (watchlist ke saare stocks ek hi taraf hain).", notify_all=True)
+            return
 
     expiry = get_monthly_expiry(today)
     ce = pick_leg(gainers, "CE", expiry, lot_map, eq_map, cfg)

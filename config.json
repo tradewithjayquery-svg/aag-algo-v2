@@ -7,7 +7,7 @@
   "num_lots": 1,
   "heartbeat_minutes": 10,
   "late_start_grace_minutes": 3,
-  "list_size": 10,
+  "list_size": 5,
   "itm_levels": 2,
   "max_spread_pct": 3.0,
   "min_oi": 0,
@@ -15,5 +15,8 @@
   "max_lot_size": 2500,
   "poll_seconds": 5,
   "use_websocket": true,
-  "feed_stale_seconds": 20
+  "feed_stale_seconds": 20,
+  "use_watchlist": true,
+  "watchlist_file": "watchlist.csv",
+  "require_direction": true
 }
