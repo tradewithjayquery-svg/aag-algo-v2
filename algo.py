@@ -276,7 +276,12 @@ def load_fo_instruments():
         )
         df = pd.read_csv(io.BytesIO(gzip.decompress(r.content)))
         fo = df[(df["exchange"] == "NSE_FO") & (df["instrument_type"] == "OPTSTK")].copy()
-        fo["base_symbol"] = fo["tradingsymbol"].str.extract(r"^([A-Z0-9&\-]+)")
+        # contract naam jaise "360ONE26DEC1000CE" / "M&M26DEC3000PE" -> base "360ONE" / "M&M"
+        fo["base_symbol"] = fo["tradingsymbol"].str.extract(
+            r"^(.+?)\d{2}[A-Z]{3}\d+(?:\.\d+)?(?:CE|PE)$")[0]
+        if "underlying_symbol" in fo.columns:
+            fo["base_symbol"] = fo["base_symbol"].fillna(fo["underlying_symbol"])
+        fo = fo[fo["base_symbol"].notna()]
         lot_map = fo.groupby("base_symbol")["lot_size"].first().astype(int).to_dict()
         fo_syms = sorted(lot_map.keys())
         eq = df[(df["exchange"] == "NSE_EQ") & (df["instrument_type"] == "EQUITY")]
