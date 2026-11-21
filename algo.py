@@ -282,6 +282,13 @@ def load_fo_instruments():
         if "underlying_symbol" in fo.columns:
             fo["base_symbol"] = fo["base_symbol"].fillna(fo["underlying_symbol"])
         fo = fo[fo["base_symbol"].notna()]
+        try:
+            ex = pd.to_numeric(fo["expiry"], errors="coerce").dropna()
+            FO_EXPIRIES.clear()
+            FO_EXPIRIES.update(datetime.fromtimestamp(v / 1000, IST).date() for v in ex.unique())
+            print(f"  Asli expiries: {sorted(FO_EXPIRIES)[:4]}")
+        except Exception as e:
+            print(f"  Expiry list nahi bani: {e}")
         lot_map = fo.groupby("base_symbol")["lot_size"].first().astype(int).to_dict()
         fo_syms = sorted(lot_map.keys())
         eq = df[(df["exchange"] == "NSE_EQ") & (df["instrument_type"] == "EQUITY")]
@@ -325,7 +332,13 @@ def last_tuesday(yr, mo):
     return last_day
 
 
+FO_EXPIRIES = set()      # broker ki list se asli stock-option expiry dates
+
+
 def get_monthly_expiry(today):
+    real = sorted(d for d in FO_EXPIRIES if d >= today)
+    if real:
+        return real[0]       # holiday hone par broker khud date shift kar deta hai
     exp = last_tuesday(today.year, today.month)
     if exp < today:
         y, m = (today.year + 1, 1) if today.month == 12 else (today.year, today.month + 1)
