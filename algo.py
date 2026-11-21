@@ -1102,6 +1102,11 @@ def main():
         entries = load_watchlist(os.path.join(HERE, cfg["watchlist_file"]))
         syms, ignored = resolve_watchlist(entries, eq_map, lot_map)
         if not syms:
+            p = os.path.join(HERE, cfg["watchlist_file"])
+            tg_admin(f"🔎 Check: file mili={os.path.exists(p)} | CSV se padhe={len(entries)} | "
+                     f"F&O symbols={len(lot_map)} | equity keys={len(eq_map)} | "
+                     f"pehle 5 padhe: {[e[0] for e in entries[:5]]} | "
+                     f"F&O sample: {list(lot_map)[:5]}")
             skip(f"{cfg['watchlist_file']} khali hai ya mili nahi / koi F&O stock nahi mila.", notify_all=True)
             return
         if ignored:
