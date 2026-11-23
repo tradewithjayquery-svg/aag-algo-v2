@@ -283,9 +283,20 @@ def load_fo_instruments():
             fo["base_symbol"] = fo["base_symbol"].fillna(fo["underlying_symbol"])
         fo = fo[fo["base_symbol"].notna()]
         try:
-            ex = pd.to_numeric(fo["expiry"], errors="coerce").dropna()
             FO_EXPIRIES.clear()
-            FO_EXPIRIES.update(datetime.fromtimestamp(v / 1000, IST).date() for v in ex.unique())
+            col = fo["expiry"].dropna().unique()
+            for v in col:
+                d = None
+                try:
+                    num = float(v)
+                    d = datetime.fromtimestamp(num / 1000 if num > 1e11 else num, IST).date()
+                except (TypeError, ValueError):
+                    try:
+                        d = pd.to_datetime(str(v)).date()
+                    except Exception:
+                        d = None
+                if d:
+                    FO_EXPIRIES.add(d)
             print(f"  Asli expiries: {sorted(FO_EXPIRIES)[:4]}")
         except Exception as e:
             print(f"  Expiry list nahi bani: {e}")
@@ -1189,6 +1200,8 @@ def main():
             return
 
     expiry = get_monthly_expiry(today)
+    if not FO_EXPIRIES:
+        tg_admin(f"ℹ️ Broker se expiry list nahi mili, calculation wali expiry use ho rahi hai: {expiry}")
     ce = pick_leg(gainers, "CE", expiry, lot_map, eq_map, cfg)
     pe = pick_leg(losers, "PE", expiry, lot_map, eq_map, cfg)
     if not ce or not pe:
