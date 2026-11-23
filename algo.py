@@ -541,6 +541,14 @@ def _num(x):
         return 0.0
 
 
+DEBUG_LINES = []
+
+
+def dbg(msg):
+    print(msg)
+    DEBUG_LINES.append(msg)
+
+
 def get_liquid_leg(symbol, ltp_fallback, expiry_date, lot_map, eq_map, side, cfg):
     """
     side = "CE" ya "PE".
@@ -551,6 +559,7 @@ def get_liquid_leg(symbol, ltp_fallback, expiry_date, lot_map, eq_map, side, cfg
     """
     eq_key = get_eq_key(symbol, eq_map)
     if not eq_key:
+        dbg(f"{symbol} {side}: equity key nahi mili")
         return None
     chain, used_expiry = [], None
     # Agar expiry holiday par shift ho gayi ho toh pichhle din try karo
@@ -565,6 +574,7 @@ def get_liquid_leg(symbol, ltp_fallback, expiry_date, lot_map, eq_map, side, cfg
             used_expiry = exp
             break
     if not chain:
+        dbg(f"{symbol} {side}: option chain khaali (expiry {expiry_date})")
         return None
 
     spot = float(chain[0].get("underlying_spot_price", ltp_fallback))
@@ -593,8 +603,10 @@ def get_liquid_leg(symbol, ltp_fallback, expiry_date, lot_map, eq_map, side, cfg
 
     for c in cands:
         sp = "no-quote" if c["spread"] is None else f"{c['spread']:.2f}%"
-        print(f"  {symbol} {side} {c['label']} {c['strike']:g}: ltp {c['ltp']} bid {c['bid']} ask {c['ask']} "
-              f"spread {sp} oi {c['oi']:.0f}")
+        dbg(f"{symbol} {side} {c['label']} {c['strike']:g}: ltp {c['ltp']} bid {c['bid']} ask {c['ask']} "
+            f"spread {sp} oi {c['oi']:.0f}")
+    if not cands:
+        dbg(f"{symbol} {side}: ATM/ITM strikes par ltp/key nahi mila (spot {spot})")
 
     ok = [c for c in cands
           if c["spread"] is not None
@@ -622,7 +634,7 @@ def pick_leg(rows, side, expiry, lot_map, eq_map, cfg):
         sym = str(s["symbol"])
         lot = lot_map.get(sym.upper())
         if max_lot and lot and lot >= max_lot:
-            print(f"  #{rank} {sym}: lot size {lot} >= {max_lot}, skip")
+            dbg(f"#{rank} {sym}: lot size {lot} >= {max_lot}, skip")
             continue
         tries += 1
         leg = get_liquid_leg(sym, row_ltp(s), expiry, lot_map, eq_map, side, cfg)
@@ -1205,6 +1217,7 @@ def main():
     ce = pick_leg(gainers, "CE", expiry, lot_map, eq_map, cfg)
     pe = pick_leg(losers, "PE", expiry, lot_map, eq_map, cfg)
     if not ce or not pe:
+        tg_admin("🔎 Strike check:\n" + "\n".join(DEBUG_LINES)[-3500:])
         skip(f"liquid strike nahi mila (CE: {'mila' if ce else 'nahi'}, PE: {'mila' if pe else 'nahi'}, "
              f"expiry {expiry}). max_spread_pct ya max_stock_tries badhakar dekho (lot size >= max_lot_size wale stocks bhi chhode jaate hain).", notify_all=True)
         return
